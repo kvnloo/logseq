@@ -877,6 +877,7 @@ DROP TRIGGER IF EXISTS blocks_au;
                    :block/title display-title
                    :block.temp/original-title (:block/title block)
                    :block.temp/unique-title unique-title
+                   :block.temp/namespace-child? (ldb/namespaced-create-child? block)
                    :page? (ldb/page? block)}
             (:include-breadcrumb? option)
             (assoc :block.temp/breadcrumb
