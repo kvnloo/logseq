@@ -107,35 +107,76 @@
 
 (defmulti handle-command (fn [action-id & _others] action-id))
 
+(defn- calendar-period?
+  "Months and years are civil-calendar periods. Their length depends on the
+   local date, so they must be applied to local fields. Minutes/hours/days/weeks
+   are instant durations.
+
+   `t/months?` / `t/years?` cannot be used here: Period is a record of every
+   unit, so `contains?` is true for :months on a days period."
+  [period]
+  (boolean (or (:months period) (:years period))))
+
+(defn- plus-period
+  "Add `period` to `datetime`.
+
+  Month and year use the local calendar so a date-only Deadline (local
+  midnight) keeps its local day: east of UTC, March 1 00:00 is still February
+  in UTC, and `t/plus` on a UtcDateTime would clamp in February (#1355).
+  Other units stay on the stored instant.
+
+  The add is one `t/plus` of the full period from `datetime`, so a 31st stays
+  a 31st when the target month has that day. Incremental month adds from a
+  clamped intermediate (Jan 31 + 5 months = Jun 30, then + 1 = Jul 30) are
+  how `++` lost the original day (#1354)."
+  [datetime period]
+  (if (calendar-period? period)
+    (-> datetime
+        t/to-default-time-zone
+        (t/plus period)
+        t/to-utc-time-zone)
+    (t/plus datetime period)))
+
+(defn- period-clock
+  "Same instant as `datetime`, in the calendar `period` is applied on.
+   Month/year counts use local fields so `t/in-months` matches `plus-period`."
+  [datetime period]
+  (if (calendar-period? period)
+    (t/to-default-time-zone datetime)
+    datetime))
+
 (defn- advance-from-completion
   "`.+` semantics: next occurrence = now + frequency * unit."
   [now recur-unit frequency]
-  (t/plus now (recur-unit frequency)))
+  (plus-period now (recur-unit frequency)))
 
 (defn- advance-from-scheduled
   "`+` semantics: next occurrence = scheduled + frequency * unit. Can land in
   the past if completion was long after scheduled — that's the documented
   behavior (\"can stack overdue\")."
   [datetime recur-unit frequency]
-  (t/plus datetime (recur-unit frequency)))
+  (plus-period datetime (recur-unit frequency)))
 
 (defn- advance-until-future
   "`++` semantics: advance from scheduled in frequency*unit steps until strictly
-  after now. cljs-time arithmetic is UTC, so adding whole weeks preserves
-  day-of-week by construction — no fix-up needed."
+  after now. Each step is computed from the original datetime so month-end
+  days are not lost to intermediate clamping. Weeks stay instant durations
+  and keep the weekday (apart from DST)."
   [now datetime recur-unit period-f frequency]
-  (let [periods (max 1
-                     (if (t/after? datetime now)
+  (let [sample (recur-unit frequency)
+        now* (period-clock now sample)
+        datetime* (period-clock datetime sample)
+        periods (max 1
+                     (if (t/after? datetime* now*)
                        1
-                       (period-f (t/interval datetime now))))
-        delta (->> (Math/ceil (/ periods frequency))
-                   (* frequency)
-                   recur-unit)
-        result (t/plus datetime delta)]
-    (loop [candidate result]
-      (if (t/after? candidate now)
-        candidate
-        (recur (t/plus candidate (recur-unit frequency)))))))
+                       (period-f (t/interval datetime* now*))))
+        n (->> (Math/ceil (/ periods frequency))
+               (* frequency))]
+    (loop [n n]
+      (let [candidate (plus-period datetime (recur-unit n))]
+        (if (t/after? candidate now)
+          candidate
+          (recur (+ n frequency)))))))
 
 (defn- repeat-next-timestamp
   "Dispatch on repeat-type db-ident to compute the next occurrence. Mirrors the
