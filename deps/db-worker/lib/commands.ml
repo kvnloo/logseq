@@ -253,8 +253,12 @@ let advance_from_scheduled (datetime : Time.civil) (u : recur_unit)
     (frequency : int) : Time.civil =
   add_units datetime u frequency
 
-(* cljs advance-until-future — `++`; cljs-time arithmetic is UTC, so adding
-   whole weeks preserves day-of-week by construction — no fix-up needed *)
+(* cljs advance-until-future — `++`. Every step counts from the original
+   datetime — datetime + n*step — rather than from the previous step's
+   result, so t/plus month-end clamping doesn't drift the day (Jan 31 + 6
+   months lands on Jul 31, not Jun 30 + 1 month = Jul 30). cljs-time
+   arithmetic is UTC, so adding whole weeks preserves day-of-week by
+   construction — no fix-up needed *)
 let advance_until_future (now : Time.civil) (datetime : Time.civil)
     (u : recur_unit) (frequency : int) : Time.civil =
   let periods =
@@ -263,13 +267,12 @@ let advance_until_future (now : Time.civil) (datetime : Time.civil)
        else in_units datetime now u)
   in
   (* periods >= 1; (p - 1) / f + 1 avoids overflowing p + f - 1 *)
-  let delta_n = ((periods - 1) / frequency + 1) * frequency in
-  let result = add_units datetime u delta_n in
-  let rec loop cand =
-    if utc_civil_after cand now then cand
-    else loop (add_units cand u frequency)
+  let steps = max 1 ((periods - 1) / frequency + 1) in
+  let rec loop n =
+    let cand = add_units datetime u (n * frequency) in
+    if utc_civil_after cand now then cand else loop (n + 1)
   in
-  loop result
+  loop steps
 
 let repeat_next_timestamp ?(now : Time.civil = utc_now ())
     (datetime : Time.civil) (u : recur_unit) (frequency : int)

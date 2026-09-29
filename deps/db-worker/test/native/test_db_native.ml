@@ -148,6 +148,129 @@ let test_ordinary_sibling_skips_closed_value_property_children () =
   check_ordinary_sibling "ordinary-sibling-skips-closed-value-property-children"
     (create_sibling_conn ":block/closed-value-property -2")
 
+(* ordinary-sibling under stale :block/order datoms: raw-datom replay
+   (sync/RTC) can leave a second :block/order datom on an entity. A stale
+   index position must not steal the candidacy from a closer live
+   sibling. conn_from_datoms keeps both datoms, as a replayed log would. *)
+let create_stale_sibling_conn () =
+  let datom = Datascript.datom in
+  let parent = Ref 1 in
+  Datascript.conn_from_datoms ~schema:(Db_test_util.schema ())
+    [ datom ~e:1 ~a:"block/title" ~v:(String "page") ();
+      datom ~e:1 ~a:"block/name" ~v:(String "page") ();
+      datom ~e:10 ~a:"block/title" ~v:(String "c0") ();
+      datom ~e:10 ~a:"block/parent" ~v:parent ();
+      datom ~e:10 ~a:"block/order" ~v:(String "a0") ();
+      datom ~e:11 ~a:"block/title" ~v:(String "c1") ();
+      datom ~e:11 ~a:"block/parent" ~v:parent ();
+      datom ~e:11 ~a:"block/order" ~v:(String "a1") ();
+      datom ~e:11 ~a:"block/order" ~v:(String "a4") ();
+      datom ~e:12 ~a:"block/title" ~v:(String "c2") ();
+      datom ~e:12 ~a:"block/parent" ~v:parent ();
+      datom ~e:12 ~a:"block/order" ~v:(String "a3") ();
+      datom ~e:13 ~a:"block/title" ~v:(String "t") ();
+      datom ~e:13 ~a:"block/parent" ~v:parent ();
+      datom ~e:13 ~a:"block/order" ~v:(String "a5") () ]
+
+let test_ordinary_sibling_ignores_stale_order_datoms () =
+  let db = db_of (create_stale_sibling_conn ()) in
+  let c1 = Option.get (block_by_title db "c1") in
+  let c2 = Option.get (block_by_title db "c2") in
+  let t = Option.get (block_by_title db "t") in
+  check "ordinary-sibling-ignores-stale-order-datoms left of t"
+    (match Ldb.get_left_sibling t with
+     | Some e -> e.id = c2.id
+     | None -> false);
+  check "ordinary-sibling-ignores-stale-order-datoms left of c2"
+    (match Ldb.get_left_sibling c2 with
+     | Some e -> e.id = c1.id
+     | None -> false)
+
+(* order-list-index propagation: emitted markers per sibling list and the
+   shifted-eid diff that augments delta.blocks. Root children cover
+   untyped/letter/number runs, an equal-order pair and a typed nested
+   parent; e30/e31 exercise the descendant representation flip. *)
+let create_order_list_delta_conn () =
+  let datom = Datascript.datom in
+  let uuid n = Uuid (Printf.sprintf "00000000-0000-4000-8000-%012d" n) in
+  let lt = "logseq.property/order-list-type" in
+  let child e parent order t uuid_n =
+    [ datom ~e ~a:"block/parent" ~v:(Ref parent) ();
+      datom ~e ~a:"block/order" ~v:(String order) ();
+      datom ~e ~a:"block/uuid" ~v:(uuid uuid_n) () ]
+    @
+    match t with
+    | Some ty -> [ datom ~e ~a:lt ~v:(String ty) () ]
+    | None -> []
+  in
+  Datascript.conn_from_datoms ~schema:(Db_test_util.schema ())
+    ([ datom ~e:1 ~a:"block/title" ~v:(String "page") ();
+       datom ~e:1 ~a:"block/uuid" ~v:(uuid 1) () ]
+     @ child 10 1 "a1" (Some "number") 10
+     @ child 11 1 "a2" (Some "number") 11
+     @ child 16 1 "a2" (Some "number") 16
+     @ child 12 1 "a3" (Some "number") 12
+     @ child 13 1 "a4" (Some "number") 13
+     @ child 14 1 "a5" None 14
+     @ child 15 1 "a6" (Some "letter") 15
+     @ child 20 1 "a7" (Some "number") 20
+     @ child 21 20 "a0" (Some "number") 21
+     @ child 22 20 "a1" None 22
+     @ child 23 20 "a2" (Some "number") 23
+     @ child 30 1 "a8" (Some "number") 30
+     @ child 31 30 "a0" (Some "number") 31
+     @ child 32 1 "a9" (Some "number") 32)
+
+(* sibling_index_markers must agree with the per-child
+   order_list_index/emitted value on every child *)
+let test_order_list_index_markers_match_per_child () =
+  let db = db_of (create_order_list_delta_conn ()) in
+  let check_list name parent =
+    let children = Ldb.get_children parent in
+    let markers = Render_delta.sibling_index_markers children in
+    List.iter
+      (fun (c : entity) ->
+         let expected = Render_delta.index_marker_of c in
+         check (name ^ " e" ^ string_of_int c.id)
+           (Hashtbl.find markers c.id = expected))
+      children
+  in
+  check_list "markers root" (Option.get (block_by_title db "page"));
+  check_list "markers nested" (Option.get (Ldb.ent_of_id db 20))
+
+(* a same-parent reorder shifts the emitted index of siblings whose own
+   datoms did not change *)
+let test_order_list_shifted_uuids_reports_displaced_sibling () =
+  let conn = create_order_list_delta_conn () in
+  let r =
+    Datascript.transact_conn conn
+      [ Datascript.Retract (Entity_id 12, "block/order", Some (String "a3"));
+        Datascript.Add (Entity_id 12, "block/order", String "az") ]
+  in
+  let shifted = Render_delta.order_list_shifted_uuids r in
+  check "shifted includes displaced D"
+    (List.mem "00000000-0000-4000-8000-000000000013" shifted);
+  check "shifted includes moved C"
+    (List.mem "00000000-0000-4000-8000-000000000012" shifted);
+  check "shifted excludes unchanged A"
+    (not (List.mem "00000000-0000-4000-8000-000000000010" shifted));
+  check "shifted excludes unchanged B"
+    (not (List.mem "00000000-0000-4000-8000-000000000011" shifted))
+
+(* reparenting a typed block flips the representation of its typed
+   descendants (ancestor count mod 3) — they are shifted even though
+   their own datoms did not change *)
+let test_order_list_shifted_uuids_covers_descendants () =
+  let conn = create_order_list_delta_conn () in
+  let r =
+    Datascript.transact_conn conn
+      [ Datascript.Retract (Entity_id 30, "block/parent", Some (Ref 1));
+        Datascript.Add (Entity_id 30, "block/parent", Ref 32) ]
+  in
+  let shifted = Render_delta.order_list_shifted_uuids r in
+  check "shifted includes descendant Y"
+    (List.mem "00000000-0000-4000-8000-000000000031" shifted)
+
 (* (deftest page-exists ...)
    cljs page-exists? returns a seq of page eids (e.g. ["foo" page]);
    Ldb.page_exists returns bool — boolean equivalents asserted. *)
@@ -2484,7 +2607,13 @@ let test_validate_block_title_unique_for_tags () =
     "Another tag named"
     (fun () ->
        Outliner_validate.validate_unique_by_name_and_tags db (Some "Card")
-         (ent_ident db "user.class/Class1") None)
+         (ent_ident db "user.class/Class1") None);
+  check "validate unique: class may use a case variant of another class name"
+    (try
+       Outliner_validate.validate_unique_by_name_and_tags db (Some "class1")
+         (ent_ident db "user.class/Class2") None;
+       true
+     with _ -> false)
 
 (* (deftest validate-block-title-unique-for-pages ...) *)
 let test_validate_block_title_unique_for_pages () =
@@ -2496,6 +2625,9 @@ let test_validate_block_title_unique_for_pages () =
             Db_test_util.blocks = [] };
           { Db_test_util.page =
               Db_test_util.{ default_page with pg_title = Some "another page" };
+            Db_test_util.blocks = [] };
+          { Db_test_util.page =
+              Db_test_util.{ default_page with pg_title = Some "Foo" };
             Db_test_util.blocks = [] };
           { Db_test_util.page =
               Db_test_util.{ default_page with pg_title = Some "Apple";
@@ -2533,7 +2665,55 @@ let test_validate_block_title_unique_for_pages () =
        Outliner_validate.validate_unique_by_name_and_tags db (Some "Apple")
          (Db_test_util.find_page_by_title db "Fruit") None;
        true
+     with _ -> false);
+  throws_with "validate unique: rename to case variant of top-level page"
+    "Another page named \"foo\" already exists."
+    (fun () ->
+       Outliner_validate.validate_unique_by_name_and_tags db (Some "foo")
+         (Db_test_util.find_page_by_title db "another page") None);
+  check "validate unique: rename to own title's case variant allowed"
+    (try
+       Outliner_validate.validate_unique_by_name_and_tags db (Some "PAGE1")
+         (Db_test_util.find_page_by_title db "page1") None;
+       true
+     with _ -> false);
+  throws_with "validate unique: rename to case variant with same tag"
+    "Another page named"
+    (fun () ->
+       Outliner_validate.validate_unique_by_name_and_tags db (Some "apple")
+         (Db_test_util.find_page_by_title db "Another Company") None);
+  check "validate unique: case variant allowed for different tag"
+    (try
+       Outliner_validate.validate_unique_by_name_and_tags db (Some "apple")
+         (Db_test_util.find_page_by_title db "Banana") None;
+       true
      with _ -> false)
+
+(* (deftest validate-block-title-unique-checks-all-candidates ...) *)
+let test_validate_block_title_unique_checks_all_candidates () =
+  let conn =
+    Db_test_util.create_conn_with_blocks
+      ~pages_and_blocks:
+        [ { Db_test_util.page =
+              Db_test_util.{ default_page with pg_title = Some "Foo";
+                             pg_tags = [ "Company" ] };
+            Db_test_util.blocks = [] };
+          { Db_test_util.page =
+              Db_test_util.{ default_page with pg_title = Some "foo";
+                             pg_tags = [ "Fruit" ] };
+            Db_test_util.blocks = [] };
+          { Db_test_util.page =
+              Db_test_util.{ default_page with pg_title = Some "Bar";
+                             pg_tags = [ "Fruit" ] };
+            Db_test_util.blocks = [] } ]
+      ()
+  in
+  let db = db_of conn in
+  throws_with "validate unique: any colliding candidate rejects the rename"
+    "Another page named"
+    (fun () ->
+       Outliner_validate.validate_unique_by_name_and_tags db (Some "FOO")
+         (Db_test_util.find_page_by_title db "Bar") None)
 
 (* (deftest validate-block-title-unique-for-namespaced-pages ...)
    :build-existing-tx? is a fixture flag; same shape via explicit
@@ -2573,6 +2753,17 @@ let test_validate_block_title_unique_for_namespaced_pages () =
                                  Db_test_util.Vec
                                    [ Db_test_util.Kw "block/uuid";
                                      Db_test_util.Uuid "3aa1e950-5a9b-4efc-81d4-b6d89a504591" ] ] };
+            Db_test_util.blocks = [] };
+          { Db_test_util.page =
+              Db_test_util.{ default_page with pg_title = Some "other";
+                             pg_extra =
+                               [ "block/parent",
+                                 Db_test_util.Vec
+                                   [ Db_test_util.Kw "block/uuid";
+                                     Db_test_util.Uuid "d246c71a-3e71-42f0-928f-afe607ee5ce0" ] ] };
+            Db_test_util.blocks = [] };
+          { Db_test_util.page =
+              Db_test_util.{ default_page with pg_title = Some "Foo" };
             Db_test_util.blocks = [] } ]
       ()
   in
@@ -2586,6 +2777,29 @@ let test_validate_block_title_unique_for_namespaced_pages () =
     (try
        Outliner_validate.validate_unique_by_name_and_tags db (Some "n4")
          (Db_test_util.find_page_by_title db "n3") None;
+       true
+     with _ -> false);
+  throws_with "validate unique: rename ns child to sibling's case variant"
+    "Another page named"
+    (fun () ->
+       Outliner_validate.validate_unique_by_name_and_tags db (Some "N2")
+         (Db_test_util.find_page_by_title db "n3") None);
+  check "validate unique: ns child may share name with other-parent page"
+    (try
+       Outliner_validate.validate_unique_by_name_and_tags db (Some "Other")
+         (Db_test_util.find_page_by_title db "n3") None;
+       true
+     with _ -> false);
+  check "validate unique: ns child may share name with top-level page"
+    (try
+       Outliner_validate.validate_unique_by_name_and_tags db (Some "foo")
+         (Db_test_util.find_page_by_title db "n3") None;
+       true
+     with _ -> false);
+  check "validate unique: top-level page may share name with ns page"
+    (try
+       Outliner_validate.validate_unique_by_name_and_tags db (Some "N2")
+         (Db_test_util.find_page_by_title db "Foo") None;
        true
      with _ -> false)
 
@@ -3160,6 +3374,7 @@ let endpoint_cases : unit Alcotest.test_case list =
     Alcotest.test_case "validate-block-title-unique-for-properties" `Quick test_validate_block_title_unique_for_properties;
     Alcotest.test_case "validate-block-title-unique-for-tags" `Quick test_validate_block_title_unique_for_tags;
     Alcotest.test_case "validate-block-title-unique-for-pages" `Quick test_validate_block_title_unique_for_pages;
+    Alcotest.test_case "validate-block-title-unique-checks-all-candidates" `Quick test_validate_block_title_unique_checks_all_candidates;
     Alcotest.test_case "validate-block-title-unique-for-namespaced-pages" `Quick test_validate_block_title_unique_for_namespaced_pages;
     Alcotest.test_case "validate-extends-property" `Quick test_validate_extends_property;
     Alcotest.test_case "validate-tags-property" `Quick test_validate_tags_property;
@@ -3177,6 +3392,10 @@ let db_test_cases : unit Alcotest.test_case list =
     Alcotest.test_case "get-journal-page-by-day" `Quick test_get_journal_page_by_day;
     Alcotest.test_case "ordinary-sibling-skips-created-from-property-children" `Quick test_ordinary_sibling_skips_created_from_property_children;
     Alcotest.test_case "ordinary-sibling-skips-closed-value-property-children" `Quick test_ordinary_sibling_skips_closed_value_property_children;
+    Alcotest.test_case "ordinary-sibling-ignores-stale-order-datoms" `Quick test_ordinary_sibling_ignores_stale_order_datoms;
+    Alcotest.test_case "order-list-index-markers-match-per-child" `Quick test_order_list_index_markers_match_per_child;
+    Alcotest.test_case "order-list-shifted-uuids-reports-displaced-sibling" `Quick test_order_list_shifted_uuids_reports_displaced_sibling;
+    Alcotest.test_case "order-list-shifted-uuids-covers-descendants" `Quick test_order_list_shifted_uuids_covers_descendants;
     Alcotest.test_case "page-exists" `Quick test_page_exists;
     Alcotest.test_case "test-transact-with-multiple-tx-datoms" `Quick test_transact_with_multiple_tx_datoms;
     Alcotest.test_case "get-bidirectional-properties" `Quick
