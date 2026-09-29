@@ -669,6 +669,87 @@ let test_apply_outliner_ops_move_up_down () =
   ignore (move [ "bbbbbbbb-0000-0000-0000-000000000003"; "bbbbbbbb-0000-0000-0000-000000000004" ] false);
   check "restored" (titles_of () = [ "b1"; "b2"; "b3"; "b4" ])
 
+(* insert-blocks with a dangling [:block/uuid ...] ref in :block/refs —
+   pasted id-refs to deleted entities arrive as raw lookup vectors in the
+   block payload. They must not crash the tx. *)
+let test_apply_outliner_ops_insert_dead_uuid_ref () =
+  let conn =
+    create_conn_with_blocks
+      ~pages_and_blocks:
+        [ { page = { default_page with pg_title = Some "p1" }
+          ; blocks =
+              [ { default_block with b_uuid = Some "dddddddd-0000-0000-0000-000000000001" } ] } ]
+      ()
+  in
+  register_conn conn;
+  let dead = "deadbeef-0000-0000-0000-000000000001" in
+  let r =
+    api "apply-outliner-ops"
+      [ Wire.String test_repo
+      ; Wire.Array
+          [ Wire.Array
+              [ kw "insert-blocks"
+              ; Wire.Array
+                  [ Wire.Array
+                      [ Wire.Map
+                          [ kw "block/uuid", Wire.Uuid "dddddddd-0000-0000-0000-000000000002"
+                          ; kw "block/title"
+                            , Wire.String ("pasted ref: [[" ^ dead ^ "]]")
+                          ; ( kw "block/refs"
+                            , Wire.Array
+                                [ Wire.Array [ kw "block/uuid"; Wire.Uuid dead ] ] ) ] ]
+                  ; Wire.Uuid "dddddddd-0000-0000-0000-000000000001"
+                  ; Wire.Map [ kw "sibling?", Wire.Bool true; kw "keep-uuid?", Wire.Bool true ] ] ] ]
+      ; Wire.Map [] ]
+  in
+  (match r with
+   | Wire.Tagged ("worker/error", _) ->
+       Alcotest.fail "apply-outliner-ops errored"
+   | _ -> ());
+  let b =
+    Option.get (entity_at_uuid (db_of conn) "dddddddd-0000-0000-0000-000000000002")
+  in
+  check "block inserted" (Ldb.string_value b "block/title" <> None)
+
+(* ensure-comments-area-for-blocks — "Add comment" on a plain block must
+   create a comments-area child tagged logseq.class/Comments pointing back
+   at the block via logseq.property.comments/blocks. *)
+let test_ensure_comments_area_for_blocks () =
+  let conn =
+    create_conn_with_blocks
+      ~pages_and_blocks:
+        [ { page = { default_page with pg_title = Some "p1" }
+          ; blocks =
+              [ { default_block with
+                  b_uuid = Some "eeeeeeee-0000-0000-0000-000000000001"
+                ; b_title = Some "target block" } ] } ]
+      ()
+  in
+  register_conn conn;
+  let buuid = "eeeeeeee-0000-0000-0000-000000000001" in
+  let r =
+    api "ensure-comments-area-for-blocks"
+      [ Wire.String test_repo; Wire.Array [ Wire.Uuid buuid ] ]
+  in
+  let area_uuid =
+    match r with
+    | Wire.Map kvs -> (
+        match List.assoc_opt (kw "block/uuid") kvs with
+        | Some (Wire.Uuid u) -> u
+        | _ -> Alcotest.fail "ensure-comments-area returned no uuid")
+    | _ -> Alcotest.fail "ensure-comments-area-for-blocks returned non-map"
+  in
+  let area = Option.get (entity_at_uuid (db_of conn) area_uuid) in
+  check "area tagged Comments"
+    (Ldb.has_tag area "logseq.class/Comments");
+  let targets = Ldb.ref_ents area "logseq.property.comments/blocks" in
+  let block_ent = Option.get (entity_at_uuid (db_of conn) buuid) in
+  check "comments/blocks points at block"
+    (List.exists (fun (t : entity) -> t.id = block_ent.id) targets);
+  let parent = Ldb.ref_ent area "block/parent" in
+  check "area under target block"
+    (match parent with Some p -> p.id = block_ent.id | None -> false)
+
 (* (deftest apply-outliner-ops-rejects-missing-indent-parent-original ...) *)
 let test_apply_outliner_ops_rejects_missing_indent_parent_original () =
   let u1 = "cccccccc-0000-0000-0000-000000000001"
@@ -2497,7 +2578,8 @@ let test_checksum_diagnostics () =
       ignore
         (Sync_client_op.update_local_checksum repo "local-checksum-1"
            (Datascript.db conn).max_tx);
-      Hashtbl.replace Sync_state.latest_remote_checksums repo "remote-checksum-1";
+      Hashtbl.replace Sync_apply.repo_latest_remote_checksum repo
+        "remote-checksum-1";
       let local, remote = Endpoint_validate.checksum_diagnostics repo in
       check "checksum local" (local = Wire.String "local-checksum-1");
       check "checksum remote" (remote = Wire.String "remote-checksum-1"))
@@ -2512,7 +2594,7 @@ let test_checksum_diagnostics_missing_remote () =
       ignore
         (Sync_client_op.update_local_checksum repo "local-checksum-123"
            (Datascript.db conn).max_tx);
-      Hashtbl.remove Sync_state.latest_remote_checksums repo;
+      Hashtbl.remove Sync_apply.repo_latest_remote_checksum repo;
       let local, remote = Endpoint_validate.checksum_diagnostics repo in
       check "checksum local present"
         (local = Wire.String "local-checksum-123");
@@ -2524,7 +2606,7 @@ let test_checksum_diagnostics_empty () =
   with_client_ops repo (fun () ->
       let conn = create_conn () in
       Worker_state.set_datascript_conn repo conn;
-      Hashtbl.remove Sync_state.latest_remote_checksums repo;
+      Hashtbl.remove Sync_apply.repo_latest_remote_checksum repo;
       let local, remote = Endpoint_validate.checksum_diagnostics repo in
       check "checksum empty local" (local = Wire.Nil);
       check "checksum empty remote" (remote = Wire.Nil))
@@ -3043,6 +3125,17 @@ let test_date_ms_transit_decodes_to_instant () =
   check "a real ~t still decodes to Instant"
     (Ds_wire.value_of_transit (Wire.Date_ms ms) = Instant ms)
 
+(* cljs ~u decode canonicalizes via transit-js UUIDfromString; a raw
+   uuid string like a JWT sub must materialize to the same canonical
+   form a kvs leaf holds, or lookups miss after leaf materialization *)
+let test_uuid_value_of_transit_canonicalizes () =
+  check "raw sub decodes to the canonical uuid transit-js produces"
+    (Ds_wire.value_of_transit (Wire.Uuid "cli-sync-stress-user")
+     = Uuid "0c00000c-000e-0000-0000-000000000000");
+  check "canonical uuids are unchanged"
+    (Ds_wire.value_of_transit (Wire.Uuid "3b8e1234-5678-4a9b-8c1d-2e3f4a5b6c7d")
+     = Uuid "3b8e1234-5678-4a9b-8c1d-2e3f4a5b6c7d")
+
 (* worker-db-fix/heal-instant-values — cljs writes inst values only on
    file/created-at|last-modified-at; a ~m anywhere else is a corrupt
    epoch-ms number and gets rewritten numeric on open *)
@@ -3190,6 +3283,10 @@ let cases =
       test_apply_outliner_ops_typing_flow_order_and_delete
   ; Alcotest.test_case "apply-outliner-ops-move-up-down" `Quick
       test_apply_outliner_ops_move_up_down
+  ; Alcotest.test_case "apply-outliner-ops-insert-dead-uuid-ref" `Quick
+      test_apply_outliner_ops_insert_dead_uuid_ref
+  ; Alcotest.test_case "ensure-comments-area-for-blocks" `Quick
+      test_ensure_comments_area_for_blocks
   ; Alcotest.test_case "get-block-sibling" `Quick test_get_block_sibling
   ; Alcotest.test_case "set-db-sync-config-keeps-only-non-auth-fields-test" `Quick
       test_set_db_sync_config_keeps_only_non_auth_fields
@@ -3355,6 +3452,8 @@ let cases =
       test_epoch_ms_value_of_transit_stays_numeric
   ; Alcotest.test_case "date-ms-transit-decodes-to-instant-test" `Quick
       test_date_ms_transit_decodes_to_instant
+  ; Alcotest.test_case "uuid-value-of-transit-canonicalizes-test" `Quick
+      test_uuid_value_of_transit_canonicalizes
   ; Alcotest.test_case "heal-instant-values-test" `Quick
       test_heal_instant_values
   ; Alcotest.test_case

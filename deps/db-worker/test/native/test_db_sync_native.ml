@@ -138,7 +138,6 @@ let preserve_state (f : unit -> 'a) : 'a =
   let remote_ck_prev = Hashtbl.copy Sync_apply.repo_latest_remote_checksum in
   let stopped_prev = Hashtbl.copy Sync_apply.repo_upload_stopped in
   let large_up_prev = Hashtbl.copy Sync_apply.repo_large_upload_progress in
-  let ck_prev = Hashtbl.copy Sync_state.latest_remote_checksums in
   let prep_prev = !(Sync_apply.prepare_upload_tx_entries_fn) in
   let flush_prev = !(Sync_apply.flush_pending_fn) in
   let client_prev = !(Sync_state.db_sync_client) in
@@ -223,9 +222,6 @@ let preserve_state (f : unit -> 'a) : 'a =
       Hashtbl.iter
         (Hashtbl.replace Sync_apply.repo_large_upload_progress)
         large_up_prev;
-      Hashtbl.reset Sync_state.latest_remote_checksums;
-      Hashtbl.iter
-        (Hashtbl.replace Sync_state.latest_remote_checksums) ck_prev;
       Sync_state.db_sync_client := client_prev;
       Sync_state.dev_or_test := dev_or_test_prev;
       Sync_apply.prepare_upload_tx_entries_fn := prep_prev;
@@ -13182,6 +13178,90 @@ let test_template_text_property_uploads_after_rebase_and_undo_redo () =
          [ false; true ])
     [ false; true ]
 
+(* cljs checksum.cljs tuple-digest digests (str attr) — keywords keep the
+   leading colon — and (some-> value str) — keyword values too. Golden
+   digests computed with a JS port of cljs digest-string/hash-code over the
+   colonized strings, so a format regression (dropping the colon) is caught
+   against a cljs-oracle value. *)
+let test_tuple_digest_matches_cljs_str_format () =
+  let digest = Db_sync_checksum.tuple_digest in
+  let checksum_of = Db_sync_checksum.checksum_of_state in
+  let u = "0180a55d-0000-7000-0000-000000000001" in
+  Alcotest.(check string)
+    "keyword attr keeps colon" "47f129bf0075bf01"
+    (checksum_of (digest (u, "block/title", String "hello")));
+  Alcotest.(check string)
+    "uuid value" "3960442260e738d6"
+    (checksum_of (digest (u, "block/uuid", Uuid u)));
+  Alcotest.(check string)
+    "int64 value" "b53b165c08b2a7e2"
+    (checksum_of
+       (digest (u, "logseq.property/created-at", Int64 1234L)));
+  Alcotest.(check string)
+    "keyword value keeps colon" "8abd67ddbbf807ef"
+    (checksum_of (digest (u, "block/tags", Keyword "logseq.class/Page")))
+
+(* cljs checksum-eligible-entity? reads raw datom values: tag membership
+   checks (:v tag-datom) against the class eid set — a literal keyword tag
+   value never matches — and (not (:v built-in?-datom)) treats only
+   falsy/absent as eligible. *)
+let test_checksum_eligible_entity_raw_datom_semantics () =
+  let db =
+    Datascript.empty_db
+      ~schema:
+        (Datascript.schema_of_edn_string
+           "{:block/uuid {:db/unique :db.unique/identity}
+             :block/tags {:db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/many}
+             :block/page {:db/valueType :db.type/ref}}")
+      ()
+    |> Datascript.db_with
+         [ Add (Temp_id "cls", "db/ident", Keyword "logseq.class/Page")
+         ; Add (Temp_id "a", "block/uuid", Uuid "aaaaaaaa-0000-4000-8000-00000000000a")
+         ; Add (Temp_id "a", "block/name", String "a")
+         ; Add (Temp_id "b", "block/uuid", Uuid "bbbbbbbb-0000-4000-8000-00000000000b")
+         ; Add (Temp_id "c", "block/uuid", Uuid "cccccccc-0000-4000-8000-00000000000c")
+         ; Add (Temp_id "c", "block/name", String "c")
+         ; Add (Temp_id "c", "logseq.property/built-in?", Bool true)
+         ; Add (Temp_id "d", "block/uuid", Uuid "dddddddd-0000-4000-8000-00000000000d")
+         ; Add (Temp_id "d", "block/name", String "d")
+         ; Add (Temp_id "d", "logseq.property/built-in?", Bool false)
+         ; Add (Temp_id "e", "block/uuid", Uuid "eeeeeeee-0000-4000-8000-00000000000e")
+         ; Add (Temp_id "f", "block/uuid", Uuid "ffffffff-0000-4000-8000-00000000000f")
+         ]
+  in
+  let by_uuid s =
+    Option.get
+      (Datascript.entid_ref db
+         (Lookup_ref ("block/uuid", Uuid s)))
+  in
+  let cls =
+    Option.get (Datascript.entid_ref db (Ident "logseq.class/Page"))
+  in
+  let a = by_uuid "aaaaaaaa-0000-4000-8000-00000000000a" in
+  let b = by_uuid "bbbbbbbb-0000-4000-8000-00000000000b" in
+  let c = by_uuid "cccccccc-0000-4000-8000-00000000000c" in
+  let d = by_uuid "dddddddd-0000-4000-8000-00000000000d" in
+  let e = by_uuid "eeeeeeee-0000-4000-8000-00000000000e" in
+  let f = by_uuid "ffffffff-0000-4000-8000-00000000000f" in
+  let db =
+    db
+    |> Datascript.db_with
+         [ Add (Entity_id a, "block/tags", Ref_to (Entity_id cls))
+         ; Raw_datom (datom ~e:b ~a:"block/tags" ~v:(Keyword "logseq.class/Page") ())
+         ; Add (Entity_id e, "block/page", Ref_to (Entity_id a))
+         ]
+  in
+  let eligible eid = Db_sync_checksum.checksum_eligible_entity db eid in
+  Alcotest.(check bool) "ref tag to page class" true (eligible a);
+  Alcotest.(check bool)
+    "literal keyword tag is not an eid" false (eligible b);
+  Alcotest.(check bool) "built-in true excluded" false (eligible c);
+  Alcotest.(check bool) "built-in false eligible" true (eligible d);
+  Alcotest.(check bool) "block/page ref eligible" true (eligible e);
+  Alcotest.(check bool)
+    "uuid alone without name/page/tags" false (eligible f)
+
 let () =
   Alcotest.run "db-sync-native"
     [ ( "db-sync"
@@ -13243,6 +13323,12 @@ let () =
         ; Alcotest.test_case
             "sync-counts-counts-only-true-pending-local-ops"
             `Quick test_sync_counts_counts_only_true_pending_local_ops
+        ; Alcotest.test_case "tuple-digest-matches-cljs-str-format" `Quick
+            test_tuple_digest_matches_cljs_str_format
+        ; Alcotest.test_case
+            "checksum-eligible-entity-uses-raw-datom-semantics"
+            `Quick
+            test_checksum_eligible_entity_raw_datom_semantics
         ; Alcotest.test_case "sync-counts-reports-stored-local-checksum"
             `Quick test_sync_counts_reports_stored_local_checksum
         ; Alcotest.test_case "pull-ok-with-older-remote-tx-is-ignored"

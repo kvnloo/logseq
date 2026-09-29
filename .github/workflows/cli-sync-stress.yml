@@ -9,6 +9,7 @@ on:
       - 'scripts/cli-sync-stress-workflow.test.mjs'
       - 'cli/**'
       - 'cli-e2e/**'
+      - 'deps/db-worker/**'
       - 'deps/db-sync/**'
       - 'src/main/frontend/worker/**'
       - 'src/test/frontend/worker/**'
@@ -22,6 +23,7 @@ on:
       - 'scripts/cli-sync-stress-workflow.test.mjs'
       - 'cli/**'
       - 'cli-e2e/**'
+      - 'deps/db-worker/**'
       - 'deps/db-sync/**'
       - 'src/main/frontend/worker/**'
       - 'src/test/frontend/worker/**'
@@ -40,7 +42,7 @@ jobs:
   cli-sync-stress:
     name: CLI sync/offline stress
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -206,7 +208,7 @@ jobs:
           "$LOGSEQ_BIN" graph validate --graph "$GRAPH" --output json --timeout-ms 60000
 
       - name: Print stress logs on failure
-        if: failure()
+        if: ${{ failure() || cancelled() }}
         run: |
           tail -n 200 tmp/cli-concurrent-edit-stress/events.jsonl || true
           tail -n 200 tmp/cli-concurrent-edit-stress/db-sync-server.log || true

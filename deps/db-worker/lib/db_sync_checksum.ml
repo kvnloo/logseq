@@ -128,17 +128,41 @@ let entity_values db eid e2ee : (string * value) list =
            Some (d.a, v)
          else None)
 
+(* cljs page-tag-eids: tag eids ldb/page? looks for. *)
+let page_tag_eids (db : db) : entity_id list =
+  List.filter_map
+    (fun ident -> entid_ref db (Ident ident))
+    [ "logseq.class/Page"; "logseq.class/Journal"; "logseq.class/Tag"
+    ; "logseq.class/Property" ]
+
+let first_datom_v db eid attr : value option =
+  match find_datom db Eavt ~e:eid ~a:attr () with
+  | Some d -> Some d.v
+  | None -> None
+
 let checksum_eligible_entity (db : db) (eid : entity_id) : bool =
-  match entity db (Entity_id eid) with
-  | Some ent ->
-      (match Ldb.value ent "block/uuid" with
-       | Some (Uuid _) ->
-           not (Ldb.built_in ent)
-           && (Ldb.is_page ent
-               || Option.is_some (Ldb.value ent "block/page")
-               || Option.is_some (Ldb.value ent "block/name"))
-       | _ -> false)
-  | None -> false
+  (* cljs checksum-eligible-entity? reads raw datoms, not entity attrs:
+     entity lookups can surface property defaults. Tag membership is an
+     eid set — only ref values can match. *)
+  match first_datom_v db eid "block/uuid" with
+  | Some (Uuid _) ->
+      (match first_datom_v db eid "logseq.property/built-in?" with
+       | Some Nil | Some (Bool false) | None ->
+           let tag_eids = page_tag_eids db in
+           List.exists
+             (fun (d : datom) ->
+                match d.v with
+                | Ref id -> List.mem id tag_eids
+                | Int64 n ->
+                    (match Datascript.Util.int64_to_int n with
+                     | Some id -> List.mem id tag_eids
+                     | None -> false)
+                | _ -> false)
+             (List.of_seq (datoms db Eavt ~e:eid ~a:"block/tags" ()))
+           || Option.is_some (first_datom_v db eid "block/page")
+           || Option.is_some (first_datom_v db eid "block/name")
+       | Some _ -> false)
+  | _ -> false
 
 (* tuple = (entity-uuid-str, attr, normalized value) *)
 module Tuple = struct
@@ -169,8 +193,10 @@ let entity_checksum_tuples db eid e2ee : Tuple_set.t =
            Tuple_set.empty
   | None -> Tuple_set.empty
 
+(* cljs (str v): keywords keep the leading colon, symbols do not. *)
 let value_str = function
-  | String s | Keyword s | Symbol s | Uuid s -> Some s
+  | String s | Symbol s | Uuid s -> Some s
+  | Keyword s -> Some (":" ^ s)
   | Int64 n -> Some (Int64.to_string n)
   | Float f -> Some (Common_util.js_string_of_float f)
   | Bool b -> Some (string_of_bool b)
@@ -181,7 +207,8 @@ let tuple_digest (entity_uuid, attr, value) =
   (fnv_offset, djb_offset)
   |> fun s -> digest_string s entity_uuid
   |> fun s -> hash_code s field_separator
-  |> fun s -> digest_string s attr
+  (* cljs (str attr) on a keyword yields ":ns/name" *)
+  |> fun s -> digest_string s (":" ^ attr)
   |> fun s -> hash_code s field_separator
   |> fun s -> digest_string s (Option.value (value_str value) ~default:"")
 

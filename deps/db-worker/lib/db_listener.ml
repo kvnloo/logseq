@@ -99,10 +99,12 @@ let log_tx_outliner_op_perf (data : Wire.t) =
           [ ("data", Ds_wire.edn_of_transit data') ]
       else if !Sync_state.outliner_perf_logging
               && List.mem (op_names_of data') e2e_perf_op_names then
+        (* cljs select-keys [:op-names :worker-apply-ms] *)
         let slim =
           Wire.Map
             (List.filter
-               (fun (k, _) -> k = kw "op-names" || k = kw "worker-apply-ms")
+               (fun (k, _) ->
+                 k = kw "op-names" || k = kw "worker-apply-ms")
                (Wire.as_map data'))
         in
         Worker_log.info ":db-worker/outliner-op-perf"
@@ -386,14 +388,24 @@ let invoke_listener_handler (timings : (string * float) list ref) k
 let process_committed_tx ~persist_enabled ~sync_db_to_main_thread
     ~(deferred : (string * handler) list) repo conn (r : tx_report) =
   let started_at = perf_time_ms () in
-  run_post_commit repo r.tx_meta "update-checksum" (fun () ->
-      !update_checksum repo r);
+  (* one sqlite txn around the two client-ops db writes — each separate
+     txn costs a real OPFS write batch, unlike cljs sql.js's in-memory
+     commits *)
+  let with_client_ops_tx f =
+    if Sync_state.has_client_ops_conn repo then
+      Sqlite.transaction (Sync_state.client_ops_conn repo) f
+    else f ()
+  in
+  with_client_ops_tx (fun () ->
+      run_post_commit repo r.tx_meta "update-checksum" (fun () ->
+          !update_checksum repo r));
   let checksum_at = perf_time_ms () in
   let handler_timings = ref [] in
   (if persist_enabled then
-     run_post_commit repo r.tx_meta "persist-local-tx" (fun () ->
-         invoke_listener_handler handler_timings "db-sync"
-           !persist_local_tx repo r));
+     with_client_ops_tx (fun () ->
+         run_post_commit repo r.tx_meta "persist-local-tx" (fun () ->
+             invoke_listener_handler handler_timings "db-sync"
+               !persist_local_tx repo r)));
   let persist_at = perf_time_ms () in
   let sync_result =
     if sync_db_to_main_thread then

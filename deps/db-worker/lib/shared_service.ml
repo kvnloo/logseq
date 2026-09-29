@@ -84,8 +84,19 @@ let wire_string (k : string) (data : Wire.t) : string option =
   | _ -> None
 
 let error_to_wire (e : exn) : Wire.t =
-  Wire.Map
-    [ Wire.String "message", Wire.String (Printexc.to_string e) ]
+  match e with
+  | Dispatcher.Exn_info (message, kvs) ->
+      (* cljs bean/->clj on an ExceptionInfo keeps message + data *)
+      Wire.Map
+        [ Wire.String "message", Wire.String message
+        ; Wire.String "data", Wire.Map kvs ]
+  | Outliner_validate.Notification w ->
+      Wire.Map
+        [ Wire.String "message", Wire.String (Printexc.to_string e)
+        ; Wire.String "data", w ]
+  | _ ->
+      Wire.Map
+        [ Wire.String "message", Wire.String (Printexc.to_string e) ]
 
 (* ---- client-id ---- *)
 
@@ -272,31 +283,41 @@ let create_on_request_handler (client_channel : Broadcast_channel.t)
                  E.pure ()))
     | _ -> ()
 
+(* Armed from <slave-registered-handler — once the master acks a slave's
+   "slave-register", matching cljs. The pending-request check keeps the
+   exclusive-lock request single; when it resolves, the master has gone
+   and the slave triggers a master re-check (which may re-register). *)
+let watch_master_lock ~service_name ~slave_client_id : unit E.t =
+  E.map
+    (fun (qr : Navigator_locks.query_result) ->
+       let already_watching =
+         List.exists
+           (fun (li : Navigator_locks.lock_info) ->
+              li.name = service_name && li.client_id = slave_client_id)
+           qr.pending
+       in
+       if not already_watching then
+         (* dont watch multiple times *)
+         do_not_wait
+           (Navigator_locks.request ~name:service_name ~mode:"exclusive"
+              (fun _lock ->
+                (* The master has gone, elect the new master *)
+                Worker_log.debug "shared-service/master-has-gone" [];
+                trigger_master_re_check "re-check";
+                E.pure ())))
+    (Navigator_locks.query ())
+
 let slave_registered_handler ~service_name ~slave_client_id ~event
     ~(register_finish : (unit E.t * unit E.resolver) option ref) : unit =
   match Wire.get "slave-client-id" event with
   | Some (Wire.String sid) when sid = slave_client_id ->
       E.async (fun () ->
-          E.bind (Navigator_locks.query ()) (fun qr ->
-              let already_watching =
-                List.exists
-                  (fun (li : Navigator_locks.lock_info) ->
-                     li.name = service_name && li.client_id = slave_client_id)
-                  qr.pending
-              in
-              if not already_watching then
-                (* dont watch multiple times *)
-                do_not_wait
-                  (Navigator_locks.request ~name:service_name
-                     ~mode:"exclusive" (fun _lock ->
-                       (* The master has gone, elect the new master *)
-                       Worker_log.debug "shared-service/master-has-gone" [];
-                       trigger_master_re_check "re-check";
-                       E.pure ()));
-              (match !register_finish with
-               | Some (_, r) -> E.wakeup r ()
-               | None -> ());
-              E.pure ()))
+          E.bind (watch_master_lock ~service_name ~slave_client_id)
+            (fun () ->
+               (match !register_finish with
+                | Some (_, r) -> E.wakeup r ()
+                | None -> ());
+               E.pure ()))
   | _ -> ()
 
 let re_requests_in_flight_on_slave (client_channel : Broadcast_channel.t)

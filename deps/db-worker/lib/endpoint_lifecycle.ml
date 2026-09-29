@@ -195,21 +195,32 @@ let stable_built_in_sync_repair_item order (m : Block_map.t) : Block_map.t =
         (Block_map.put m "block/created-at" (Datascript.Int64 0L))
         "block/updated-at" (Datascript.Int64 0L)
     in
-    (match Block_map.attr_value m "db/ident" with
-     | Some (Datascript.Keyword ident)
-       when not (List.mem ident built_in_sync_repair_unordered_classes) ->
-         (match order with
-          | Some o -> Block_map.put m "block/order" (Datascript.String o)
-          | None -> m)
-     | _ -> m)
+    let unordered =
+      match Block_map.attr_value m "db/ident" with
+      | Some (Datascript.Keyword ident) ->
+          List.mem ident built_in_sync_repair_unordered_classes
+      | _ -> false
+    in
+    if unordered then m
+    else
+      match order with
+      | Some o -> Block_map.put m "block/order" (Datascript.String o)
+      | None -> m
   else m
 
 (* cljs db-core/built-in-sync-repair-tx-data *)
 let built_in_sync_repair_tx_data () : Wire.t list =
   let new_properties =
-    Builtin_data.built_in_properties
-    |> List.filter (fun (b : Builtin_data.builtin_property) ->
-           List.mem b.Builtin_data.ident built_in_sync_repair_properties)
+    (* cljs selects the property entries by the repair idents' order — a
+       cljs select-keys map iterates in keys order, so the tx must emit
+       repeat-type before comments/blocks even though the property table
+       declares them in the opposite order. *)
+    built_in_sync_repair_properties
+    |> List.map (fun ident ->
+           List.find
+             (fun (b : Builtin_data.builtin_property) ->
+                b.Builtin_data.ident = ident)
+             Builtin_data.built_in_properties)
     |> Sqlite_create_graph.build_properties
     |> List.map Sqlite_create_graph.mark_block_as_built_in
   in
@@ -346,6 +357,10 @@ let create_or_open_db args =
                  Sqlite.exec db ~sql:"pragma locking_mode=exclusive" ~bind:[||];
                  Sqlite.exec db ~sql:"pragma journal_mode=WAL" ~bind:[||];
                  Sqlite.exec db ~sql:"pragma wal_autocheckpoint=0" ~bind:[||];
+                 (* synchronous=NORMAL: WAL checkpoints still fsync, but
+                    per-commit fsyncs are skipped — matches the cljs
+                    sql.js in-memory durability envelope. *)
+                 Sqlite.exec db ~sql:"pragma synchronous=NORMAL" ~bind:[||];
                  Worker_state.set_sqlite_conn repo db;
                  (db, true)
            in
@@ -354,15 +369,10 @@ let create_or_open_db args =
            if created_sqlite && not (Worker_state.publishing ()) then
              ignore (Sync_state.client_ops_conn repo);
            (* cljs get-dbs opens the :search sqlite inside the pool on every
-              open so tx-listener upserts hit it immediately; cljs runs
-              enable-sqlite-wal-mode! on it inside the when-not-sqlite-conn
-              block together with the other dbs. *)
-           (match Endpoint_search.get_search_db repo with
-            | Some search_db when created_sqlite ->
-                Sqlite.exec search_db ~sql:"pragma locking_mode=exclusive"
-                  ~bind:[||];
-                Sqlite.exec search_db ~sql:"pragma journal_mode=WAL" ~bind:[||]
-            | _ -> ());
+              open so tx-listener upserts hit it immediately; the
+              enable-sqlite-wal-mode! pragmas run inside open_search_db
+              before its tables are created. *)
+           ignore (Endpoint_search.get_search_db repo);
            let finish () : Wire.t Db_worker_effect.t =
              Graph_store.create_kvs_table db;
              let storage = Graph_store.storage db in
@@ -450,17 +460,21 @@ let create_or_open_db args =
                       ~tx_meta:[ "initial-db?", Datascript.Bool true ])
                else None
              in
+             (* cljs (when-not sync-download-graph?
+                (let [migrate-result (db-migrate/migrate conn)] ...)
+                (transaction-handler/maybe-run-recycle-gc! conn)) — both
+                gated: a sync-download open hands an empty conn to the
+                importer, and the recycle-gc upsert would allocate eid 1
+                before the imported datoms arrive. *)
              (if not sync_download then begin
-                (* cljs (if migrate-result (handle-migrate-result-local-txs!
-                   ...) (maybe-enqueue-built-in-sync-repair! ...)) *)
-                match Db_migrate.migrate conn with
-                | Some result ->
-                    handle_migrate_result_local_txs repo result
-                | None ->
-                    maybe_enqueue_built_in_sync_repair repo conn None
-                      initial_data_exists
-              end;
-              Endpoint_transaction.maybe_run_recycle_gc conn);
+                (match Db_migrate.migrate conn with
+                 | Some result ->
+                     handle_migrate_result_local_txs repo result
+                 | None ->
+                     maybe_enqueue_built_in_sync_repair repo conn None
+                       initial_data_exists);
+                Endpoint_transaction.maybe_run_recycle_gc conn
+              end);
              (* cljs (when initial-tx-report (db-sync/handle-local-tx! repo
                 initial-tx-report)). *)
              (match initial_tx_report with
